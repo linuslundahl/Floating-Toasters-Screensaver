@@ -11,10 +11,6 @@
 
 #import "Flying_ToastersView.h"
 
-/// Movement direction: from top-right to bottom-left at a 45° angle,
-/// matching the CSS `translate(-1600px, 1600px)` keyframe.
-static const CGFloat kFlightAngle = M_PI / 4.0;
-
 /// Flap animation: 4 frames, 0.2s per full cycle, alternating direction.
 static const NSTimeInterval kFlapCycleDuration = 0.2;
 static const NSInteger kFlapFrameCount = 4;
@@ -42,6 +38,9 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
 /// Per-object offset (in points) along the flight direction, used to spread
 /// same-speed objects so they don't ride on top of each other.
 @property (nonatomic) CGFloat scatter;
+/// Per-object lateral offset in [-1, 1) across the entry corner, shifting the
+/// start point along the top/right edges so entry positions vary.
+@property (nonatomic) CGFloat lane;
 @end
 
 @implementation FTFlyingObject
@@ -53,6 +52,7 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
     NSArray<FTFlyingObject *> *_objects;
     NSDate *_startDate;
     NSTimeInterval _elapsedOverride; // test hook; NAN when unused
+    NSUInteger _screenSeed;   // stable per-screen seed; varies the pattern
 }
 
 /// Test hook: when set to a non-NAN value, animateOneFrame uses this elapsed
@@ -60,6 +60,13 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
 - (void)testSetElapsedOverride:(NSTimeInterval)elapsed
 {
     _elapsedOverride = elapsed;
+}
+
+/// Test hook: force the per-screen seed. Not used by the screensaver itself.
+- (void)testSetSeed:(NSUInteger)seed
+{
+    _screenSeed = seed;
+    _objects = [self buildObjects];
 }
 
 - (NSTimeInterval)currentElapsed
@@ -82,9 +89,33 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
         _toasterSprite = [bundle imageForResource:@"toaster-sprite"];
         _toastImage = [bundle imageForResource:@"toast1"];
 
+        // Default seed from the view frame's global position. startAnimation
+        // refines this from the actual NSScreen once we're in a window.
+        _screenSeed = [self seedFromScreenFrame:frame];
+
         _objects = [self buildObjects];
     }
     return self;
+}
+
+/// Derives a stable seed from a frame's position/size so each physical
+/// screen (which sits at a distinct global origin) gets a distinct pattern.
+- (NSUInteger)seedFromScreenFrame:(NSRect)frame
+{
+    NSUInteger h = 1469598103934665603ull; // FNV-1a offset basis
+    NSUInteger values[] = {
+        (NSUInteger)frame.origin.x, (NSUInteger)frame.origin.y,
+        (NSUInteger)frame.size.width, (NSUInteger)frame.size.height
+    };
+    for (int i = 0; i < 4; i++) {
+        NSUInteger v = values[i];
+        for (int b = 0; b < 8; b++) {
+            h ^= (v & 0xff);
+            h *= 1099511628211ull; // FNV prime
+            v >>= 8;
+        }
+    }
+    return h;
 }
 
 /// Recreates the full object roster from the original CSS implementation:
@@ -181,9 +212,22 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
         @[ @(FTObjectKindToaster), @24.0, @20.0, @YES, @26 ],
     ];
 
-    NSMutableArray<FTFlyingObject *> *objects = [NSMutableArray arrayWithCapacity:roster.count];
+    // Shuffle the roster with a Fisher–Yates pass seeded per screen. This
+    // keeps the same fleet composition (same kinds, speeds, delays) but
+    // reassigns them to different entry positions, so each monitor runs a
+    // genuinely different animation instead of the same choreography with
+    // only small offsets.
+    NSMutableArray<NSArray<id> *> *shuffled = [roster mutableCopy];
+    for (NSInteger i = (NSInteger)shuffled.count - 1; i > 0; i--) {
+        NSUInteger r = _screenSeed ^ ((NSUInteger)i * 2654435761u);
+        r ^= r >> 13; r *= 1103515245u; r ^= r >> 16;
+        NSInteger j = (NSInteger)(r % ((NSUInteger)i + 1));
+        [shuffled exchangeObjectAtIndex:(NSUInteger)i withObjectAtIndex:(NSUInteger)j];
+    }
+
+    NSMutableArray<FTFlyingObject *> *objects = [NSMutableArray arrayWithCapacity:shuffled.count];
     NSUInteger index = 0;
-    for (NSArray<id> *entry in roster) {
+    for (NSArray<id> *entry in shuffled) {
         NSNumber *positionKey = entry[4];
         NSArray<NSNumber *> *pos = positions[positionKey];
         if (!pos) { continue; }
@@ -196,11 +240,16 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
         object.anchor = NSMakePoint(pos[0].doubleValue / 100.0,
                                     pos[1].doubleValue / 100.0);
 
-        // Deterministic pseudo-random scatter in [-1, 1) from the index, so
-        // it's stable every frame without storing extra state.
-        NSUInteger x = (index + 1) * 2654435761u; // Knuth multiplicative hash
+        // Deterministic pseudo-random values in [-1, 1), hashed from the
+        // index AND the per-screen seed so each monitor gets a different
+        // pattern of entry positions and timing.
+        NSUInteger x = (index + 1) * 2654435761u ^ (_screenSeed * 2246822519u);
         x ^= x >> 13; x *= 1103515245u; x ^= x >> 16;
         object.scatter = ((double)(x % 2000) / 1000.0) - 1.0;
+
+        NSUInteger y = (index + 1) * 2246822519u ^ (_screenSeed * 2654435761u);
+        y ^= y >> 13; y *= 1103515245u; y ^= y >> 16;
+        object.lane = ((double)(y % 2000) / 1000.0) - 1.0;
 
         [objects addObject:object];
         index++;
@@ -212,6 +261,14 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
 {
     [super startAnimation];
     _startDate = [NSDate date];
+
+    // Now that we're attached to a window, derive a seed from the actual
+    // physical screen so each monitor gets a distinct flight pattern.
+    NSScreen *screen = self.window.screen;
+    if (screen) {
+        _screenSeed = [self seedFromScreenFrame:screen.frame];
+        _objects = [self buildObjects]; // rebuild with the real screen seed
+    }
 }
 
 - (void)stopAnimation
@@ -238,13 +295,18 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
     // Sprites render at native 64pt (previously 50).
     CGFloat spriteSize = kSpriteSize;
 
-    // Each object glides along the 45° diagonal from off the top-right edge
-    // to off the bottom-left edge. The travel distance covers the full
-    // diagonal plus the maximum scatter range plus sprite margins, so every
-    // object — however scattered — starts and ends completely off-screen.
+    // Flight is always the classic 45° diagonal: enter from the top-right
+    // corner, exit bottom-left (matching the original CSS keyframes).
+    const CGFloat s = M_SQRT1_2; // 1/√2 for a 45° unit step
+    const NSPoint dir = NSMakePoint(-s, -s);
+
+    // Travel distance covers the full diagonal plus the maximum scatter and
+    // lane ranges plus sprite margins, so every object — however offset —
+    // starts and ends completely off-screen.
     CGFloat diagonal = hypot(size.width, size.height);
     CGFloat scatterRange = diagonal * 0.30;      // scatter span along flight axis
-    CGFloat distance = diagonal + scatterRange + spriteSize * 4.0;
+    CGFloat laneRange = diagonal * 0.5;          // lateral span across entry corner
+    CGFloat distance = diagonal + scatterRange + laneRange + spriteSize * 4.0;
 
     for (FTFlyingObject *object in _objects) {
         NSTimeInterval t = elapsed - object.delay;
@@ -254,11 +316,19 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
         CGFloat travelled = progress * distance;
 
         // Convert the CSS `right`/`top` fractions into a bottom-left-origin
-        // point. CSS `right: R%` places the object's right edge R% of width
-        // from the screen's right edge; `top: T%` places its top edge T% of
-        // height below the top. Negative R/T push it beyond those edges.
+        // STARTING point off the top-right corner. CSS `right: R%` places
+        // the object's right edge R% of width from the screen's right edge;
+        // `top: T%` places its top edge T% of height below the top. Negative
+        // R/T push it beyond those edges (off-screen).
         CGFloat baseX = size.width  - object.anchor.x * size.width  - spriteSize;
         CGFloat baseY = size.height - object.anchor.y * size.height - spriteSize;
+
+        // Lane shifts the start point laterally across the entry corner
+        // (along the anti-diagonal), so objects enter at varying positions
+        // along the top and right edges instead of a fixed line.
+        CGFloat laneOffset = object.lane * laneRange;
+        baseX += laneOffset * s;
+        baseY -= laneOffset * s;
 
         // Scatter shifts the object's START anchor *back* along the flight
         // axis (further off-screen) by 0..scatterRange. Because the shift only
@@ -266,11 +336,11 @@ typedef NS_ENUM(NSInteger, FTObjectKind) {
         // progress == 0 the object is always fully off-screen; it then floats
         // in. This staggers entry timing and separates same-speed objects.
         CGFloat backoff = (object.scatter + 1.0) * 0.5 * scatterRange; // 0..scatterRange
-        CGFloat startX = baseX + backoff * cos(kFlightAngle);
-        CGFloat startY = baseY + backoff * sin(kFlightAngle);
+        CGFloat startX = baseX - dir.x * backoff;
+        CGFloat startY = baseY - dir.y * backoff;
 
-        NSPoint position = NSMakePoint(startX - travelled * cos(kFlightAngle),
-                                       startY - travelled * sin(kFlightAngle));
+        NSPoint position = NSMakePoint(startX + dir.x * travelled,
+                                       startY + dir.y * travelled);
 
         NSRect destRect = NSMakeRect(position.x, position.y, spriteSize, spriteSize);
 
